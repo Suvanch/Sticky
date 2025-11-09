@@ -1,0 +1,194 @@
+// -------- Pins --------
+const int TILT_PIN   = 13;   // tilt switch to GND (INPUT_PULLUP)
+const int BTN_PIN    = 3;    // button to GND (INPUT_PULLUP)
+const int BUZZER_PIN = 2;    // passive buzzer (+) here, (-) to GND
+
+// Ultrasonic
+const int TRIG_PIN   = 9;
+const int ECHO_PIN   = 10;
+
+// -------- Timings --------
+const unsigned long TILT_DEBOUNCE_MS  = 80;
+const unsigned long FALL_HOLD_MS      = 3000;  // side >= 3s
+const unsigned long BTN_DEBOUNCE_MS   = 60;
+
+// Proximity beep windows (ms)
+struct Pattern { unsigned onMs; unsigned offMs; unsigned freq; };
+const Pattern PAT_CLOSE  = {100, 100, 2200};   // <= 10 cm
+const Pattern PAT_MED    = {150, 200, 2000};   // 10–30 cm
+const Pattern PAT_FAR    = {200, 400, 1800};   // 30–50 cm
+
+// -------- State machine for fall --------
+enum State { IDLE, SIDE_PENDING, ALARM };
+State state = IDLE;
+unsigned long stateStart = 0;
+
+// Tilt debounce
+int tiltLastRaw = HIGH, tiltStable = HIGH;
+unsigned long tiltLastChange = 0;
+
+// Button debounce + edge
+int btnLastRaw = HIGH, btnStable = HIGH, btnPrevStable = HIGH;
+unsigned long btnLastChange = 0;
+
+// Proximity beeper (non-blocking)
+unsigned long buzzWindowStart = 0;
+bool buzzOnWindow = false;
+bool alarmActive = false;
+
+// -------- Helpers: buzzer control --------
+void beepOn(unsigned freq) {
+  if (!alarmActive) { tone(BUZZER_PIN, freq); }
+}
+void beepOff() {
+  noTone(BUZZER_PIN);
+}
+
+// -------- Debounce & reads --------
+void readTilt() {
+  unsigned long now = millis();
+  int raw = digitalRead(TILT_PIN);
+  if (raw != tiltLastRaw) { tiltLastRaw = raw; tiltLastChange = now; }
+  if (now - tiltLastChange >= TILT_DEBOUNCE_MS) tiltStable = raw;
+}
+bool isSideways() {
+  // With INPUT_PULLUP and one leg to GND, many tilt switches read LOW when sideways.
+  // If yours is opposite, flip this to (tiltStable == HIGH).
+  return tiltStable == HIGH;
+}
+void readButton() {
+  unsigned long now = millis();
+  int raw = digitalRead(BTN_PIN);
+  if (raw != btnLastRaw) { btnLastRaw = raw; btnLastChange = now; }
+  if (now - btnLastChange >= BTN_DEBOUNCE_MS) {
+    btnPrevStable = btnStable;
+    btnStable = raw;
+  }
+}
+bool buttonPressedEdge() {
+  // active-LOW; detect HIGH -> LOW transition
+  return (btnPrevStable == HIGH && btnStable == LOW);
+}
+
+// -------- Fall state transitions --------
+void enter(State s) {
+  state = s;
+  stateStart = millis();
+  if (s == ALARM) {
+    alarmActive = true;
+    tone(BUZZER_PIN, 2000);  // continuous alarm
+  } else {
+    alarmActive = false;
+    beepOff();
+    // reset proximity window so it restarts cleanly
+    buzzOnWindow = false;
+    buzzWindowStart = millis();
+  }
+}
+
+// -------- Ultrasonic distance (non-blocking-ish) --------
+float readDistanceCm() {
+  // trigger pulse
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // echo with timeout ~30ms (about 5m range)
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 30000UL);
+  if (duration == 0) return -1; // no echo
+  return (duration * 0.0343f) / 2.0f;
+}
+
+// -------- Proximity beeper (only when NOT in ALARM) --------
+void runProximityBeep() {
+  if (alarmActive) return; // ALARM owns the buzzer
+
+  static unsigned long lastMeasure = 0;
+  static float lastDistance = -1;
+
+  unsigned long now = millis();
+  // sample distance every ~60ms to keep things responsive
+  if (now - lastMeasure >= 60) {
+    lastMeasure = now;
+    lastDistance = readDistanceCm();
+  }
+
+  // pick pattern based on lastDistance
+  const Pattern* p = nullptr;
+  if (lastDistance > 0 && lastDistance <= 10)        p = &PAT_CLOSE;
+  else if (lastDistance > 10 && lastDistance <= 30)  p = &PAT_MED;
+  else if (lastDistance > 30 && lastDistance <= 50)  p = &PAT_FAR;
+
+  if (!p) { // silent when no object in range
+    buzzOnWindow = false;
+    beepOff();
+    return;
+  }
+
+  // non-blocking on/off windows using millis
+  if (!buzzOnWindow) {
+    // start ON window
+    buzzOnWindow = true;
+    buzzWindowStart = now;
+    beepOn(p->freq);
+  } else {
+    unsigned long elapsed = now - buzzWindowStart;
+    if (elapsed >= p->onMs) {
+      // switch to OFF window
+      beepOff();
+      // keep off for offMs, then restart a new ON window
+      if (elapsed >= (unsigned long)(p->onMs + p->offMs)) {
+        buzzOnWindow = false;
+      }
+    }
+  }
+}
+
+void setup() {
+  pinMode(TILT_PIN, INPUT_PULLUP);
+  pinMode(BTN_PIN,  INPUT_PULLUP);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  beepOff();
+  enter(IDLE);
+}
+
+void loop() {
+  // Inputs
+  readTilt();
+  readButton();
+
+  // Button always stops ALARM if it's active
+  if (buttonPressedEdge() && state == ALARM) {
+    enter(IDLE);
+  }
+
+  // Fall detection state machine
+  bool sideways = isSideways();
+
+  switch (state) {
+    case IDLE:
+      if (sideways) enter(SIDE_PENDING);
+      break;
+
+    case SIDE_PENDING:
+      if (!sideways) { enter(IDLE); break; }
+      if (millis() - stateStart >= FALL_HOLD_MS) {
+        enter(ALARM); // continuous alarm; proximity is ignored while alarmActive
+      }
+      break;
+
+    case ALARM:
+      // Stay in ALARM until button press (handled above).
+      break;
+  }
+
+  // Proximity beeps only if not in ALARM
+  if (state != ALARM) {
+    runProximityBeep();
+  }
+}
