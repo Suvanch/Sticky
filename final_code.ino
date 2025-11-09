@@ -1,6 +1,6 @@
 // -------- Pins --------
 const int TILT_PIN   = 13;   // tilt switch to GND (INPUT_PULLUP)
-const int BTN_PIN    = 3;    // button to GND (INPUT_PULLUP)
+const int BTN_PIN    = 7;    // button to GND (INPUT_PULLUP)
 const int BUZZER_PIN = 2;    // buzzer (+) here, (-) to GND
 
 // Ultrasonic
@@ -15,7 +15,7 @@ const float NOMINAL_RESISTANCE  = 10000.0;  // 10k at 25°C
 const float NOMINAL_TEMPERATURE = 25.0;     // 25 °C
 const float B_COEFFICIENT       = 3950.0;   // typical value
 const float KELVIN_OFFSET       = 273.15;
-const float ICE_THRESHOLD_C     = 18.0;     // adjust after testing
+const float ICE_THRESHOLD_C     = 20.0;     // adjust after testing
 
 // -------- Timings --------
 const unsigned long TILT_DEBOUNCE_MS  = 80;
